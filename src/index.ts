@@ -333,14 +333,46 @@ server.registerTool("leave_talk", {
 
 // ---------- login ----------
 
+async function openBrowser(url: string) {
+  const { spawn } = await import("node:child_process");
+  const [cmd, args] = process.platform === "win32" ? ["cmd", ["/c", "start", "", url]]
+    : process.platform === "darwin" ? ["open", [url]] : ["xdg-open", [url]];
+  spawn(cmd, args, { stdio: "ignore", detached: true }).on("error", () => {}).unref();
+}
+
+// First run: walk the user through registering their own direct app, then save its credentials.
+async function askClientCredentials(redirect: string) {
+  const { createInterface } = await import("node:readline/promises");
+  console.error(`
+No direct app credentials yet. Register your own app (one time):
+  1. Open https://direct4b.com/applications (logged in to direct)
+  2. Register a new application:
+       Application name : anything, e.g. "direct4b-mcp (<your name>)"
+       Site URL         : ${redirect}
+       Redirect URL     : ${redirect}
+  3. Paste the Client ID and Client Secret shown after registering.
+  Guide with screenshots: https://github.com/i-m-abbhay/direct4b-mcp/blob/main/docs/SETUP.md
+`);
+  await openBrowser("https://direct4b.com/applications");
+  // Line iterator instead of rl.question: question() drops lines that arrive before it's asked (piped input).
+  const rl = createInterface({ input: process.stdin, output: process.stderr });
+  const lines = rl[Symbol.asyncIterator]();
+  const ask = async (q: string) => { process.stderr.write(q); return String((await lines.next()).value ?? "").trim(); };
+  const id = await ask("Client ID: ");
+  const secret = await ask("Client Secret: ");
+  rl.close();
+  if (!id || !secret) { console.error("Both are required."); process.exit(1); }
+  mkdirSync(DIR, { recursive: true });
+  writeFileSync(join(DIR, "client.env"), `DIRECT4B_CLIENT_ID=${id}\nDIRECT4B_CLIENT_SECRET=${secret}\n`, { mode: 0o600 });
+  console.error(`Saved to ${join(DIR, "client.env")}\n`);
+  return { DIRECT4B_CLIENT_ID: id, DIRECT4B_CLIENT_SECRET: secret };
+}
+
 async function login() {
-  const env = { ...readEnvFile(join(DIR, "client.env")), ...process.env };
-  const cid = env.DIRECT4B_CLIENT_ID, secret = env.DIRECT4B_CLIENT_SECRET;
+  let env: Record<string, string | undefined> = { ...readEnvFile(join(DIR, "client.env")), ...process.env };
   const redirect = env.DIRECT4B_REDIRECT_URI ?? "http://127.0.0.1:8080/";
-  if (!cid || !secret) {
-    console.error(`Set DIRECT4B_CLIENT_ID and DIRECT4B_CLIENT_SECRET (env or ${join(DIR, "client.env")}).`);
-    process.exit(1);
-  }
+  if (!env.DIRECT4B_CLIENT_ID || !env.DIRECT4B_CLIENT_SECRET) env = { ...env, ...(await askClientCredentials(redirect)) };
+  const cid = env.DIRECT4B_CLIENT_ID!, secret = env.DIRECT4B_CLIENT_SECRET!;
   const state = randomBytes(16).toString("hex");
   const authUrl = "https://direct4b.com/oauth2/authorize?" + new URLSearchParams({
     response_type: "code", client_id: cid, redirect_uri: redirect, scope: SCOPES, state, prompt: "consent",
@@ -365,7 +397,10 @@ async function login() {
     console.error(`Saved token to ${join(DIR, "token.json")} (scopes: ${tok.scope})`);
     srv.close();
   });
-  srv.listen(port, "127.0.0.1", () => console.error(`Open ${redirect} in your browser and approve.`));
+  srv.listen(port, "127.0.0.1", () => {
+    console.error(`Opening ${redirect} in your browser. Click 承認する (Approve) there.`);
+    openBrowser(redirect);
+  });
 }
 
 // Only run when executed directly (tests import this module for its helpers).

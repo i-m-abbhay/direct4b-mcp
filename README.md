@@ -19,18 +19,14 @@ MCP server for [direct](https://direct4b.com) (direct4b) business chat. Lets Cla
 
 ## Setup
 
-1. **Get the app credentials** (Client ID + Client Secret) from whoever registered the company's direct app at <https://direct4b.com/applications>. The app's redirect URL must be `http://127.0.0.1:8080/`.
-2. **Save them** in `~/.direct4b/client.env`:
-   ```
-   DIRECT4B_CLIENT_ID=...
-   DIRECT4B_CLIENT_SECRET=...
-   ```
-3. **Log in** (opens direct's approval page; saves a non-expiring token to `~/.direct4b/token.json`):
+**Step-by-step guide with screenshots (日本語 / English): [docs/SETUP.md](docs/SETUP.md)**
+
+1. **Log in:**
    ```
    npx direct4b-mcp login
    ```
-   Then open <http://127.0.0.1:8080/> and click 承認する.
-4. **Add to Claude Code**:
+   The first time, it opens <https://direct4b.com/applications> so you can register your own app (Site URL and Redirect URL: `http://127.0.0.1:8080/`), asks for its Client ID and Client Secret, and saves them to `~/.direct4b/client.env`. Then it opens direct's approval page; click 承認する. A non-expiring token is saved to `~/.direct4b/token.json`.
+2. **Add to Claude Code**:
    ```
    claude mcp add direct4b --scope user -- npx -y direct4b-mcp
    ```
