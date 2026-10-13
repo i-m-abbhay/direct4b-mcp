@@ -88,15 +88,20 @@ function talkName(t: any, meId?: string): string {
 
 const ACTION_LABEL: Record<number, string> = { 500: "yes/no", 502: "select", 504: "task" };
 
+// Mentions are stored as `{@:<user_id>,<name length>}@Name`; the visible `@Name` follows the marker.
+const MENTION = /\{@:(\d+),\d+\}/g;
+export const cleanMentions = (s: string) => s.replace(MENTION, "");
+const rawText = (m: any): string => (typeof m.content === "string" ? m.content : m.content?.text ?? "");
+
 export function renderContent(m: any): string {
   const c = m.content;
   // The list API omits content for action messages (yes/no, select, task).
   if (c == null) return `[${ACTION_LABEL[m.type] ?? `type ${m.type}`}] (content not returned by API)`;
   switch (m.type) {
-    case 1: return c;
-    case 2: return `[stamp]${c.text ? " " + c.text : ""}`;
+    case 1: return cleanMentions(c);
+    case 2: return `[stamp]${c.text ? " " + cleanMentions(c.text) : ""}`;
     case 4: return `[file ${c.name} key=${c.key}]`;
-    case 5: return `${c.text ?? ""} ${(c.files ?? []).map((f: any) => `[file ${f.name} key=${f.key}]`).join(" ")}`.trim();
+    case 5: return `${cleanMentions(c.text ?? "")} ${(c.files ?? []).map((f: any) => `[file ${f.name} key=${f.key}]`).join(" ")}`.trim();
     case 7: return "[deleted]";
     case 500: return `[yes/no] ${c.question}`;
     case 502: return `[select] ${c.question} options=${JSON.stringify(c.options)}`;
@@ -175,6 +180,36 @@ server.registerTool("read_messages", {
   if (!msgs.length) return ok(`No messages in "${talkName(talk)}" after that point.`);
   const lines = msgs.map((m: any) => `${m.created_at_str} ${names.get(m.user_id_str) ?? m.user_id_str} (${m.message_id_str}): ${renderContent(m)}`);
   return ok(`Talk: ${talkName(talk)}\n${lines.join("\n")}\n\nlast message_id: ${msgs.at(-1).message_id_str}`);
+});
+
+server.registerTool("find_mentions", {
+  description: "Find messages that @mention the current user (or another user) across all talks, newest first. Scans only talks with activity in the window.",
+  inputSchema: {
+    since: z.string().optional().describe('Relative ("2h", "3d") or ISO date. Default "3d".'),
+    user_id: id.optional().describe("Whose mentions to find. Default: current user"),
+    limit: z.number().int().min(1).max(100).optional().describe("Max results (default 20)"),
+  },
+  annotations: READ,
+}, async ({ since, user_id, limit }) => {
+  const after = sinceToId(since ?? "3d");
+  const [talks, me] = await Promise.all([api("GET", "/talks"), api("GET", "/users/me")]);
+  const target = user_id ?? me.user_id_str;
+  const active = talks.filter((t: any) => BigInt(t.max_message_id_str ?? 0) > BigInt(after));
+  const hits: any[] = [];
+  // Sequential on purpose: the read rate limit is ~10 rapid calls, api() backs off on 429.
+  // ponytail: 200 messages per talk; a talk busier than that in the window loses its oldest mentions.
+  for (const t of active) {
+    const names = new Map((t.users ?? []).map((u: any) => [u.user_id_str, u.name]));
+    for (const m of await api("GET", `/talks/${t.talk_id_str}/messages?since_id=${after}&count=200`)) {
+      if ([...rawText(m).matchAll(MENTION)].some((x) => x[1] === target))
+        hits.push({
+          time: m.created_at_str, talk: talkName(t, me.user_id_str), talk_id: t.talk_id_str,
+          from: names.get(m.user_id_str) ?? m.user_id_str, message_id: m.message_id_str, text: renderContent(m),
+        });
+    }
+  }
+  hits.sort((a, b) => b.time.localeCompare(a.time));
+  return ok(hits.length ? hits.slice(0, limit ?? 20) : `No mentions in ${active.length} active talks since ${since ?? "3d"}.`);
 });
 
 server.registerTool("send_message", {
