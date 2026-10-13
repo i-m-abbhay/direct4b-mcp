@@ -86,8 +86,12 @@ function talkName(t: any, meId?: string): string {
   return t.type === "pair" ? `DM: ${others.join(", ")}` : `(unnamed ${t.type})`;
 }
 
+const ACTION_LABEL: Record<number, string> = { 500: "yes/no", 502: "select", 504: "task" };
+
 export function renderContent(m: any): string {
   const c = m.content;
+  // The list API omits content for action messages (yes/no, select, task).
+  if (c == null) return `[${ACTION_LABEL[m.type] ?? `type ${m.type}`}] (content not returned by API)`;
   switch (m.type) {
     case 1: return c;
     case 2: return `[stamp]${c.text ? " " + c.text : ""}`;

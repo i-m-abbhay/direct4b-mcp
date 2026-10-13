@@ -14,6 +14,7 @@ assert.ok(drift >= -1000n && drift <= 1000n, `drift ${drift}ms`);
 assert.equal(BigInt(sinceToId("2h", 1e12)) >> 22n, BigInt(1e12 - 2 * 3600e3) - 1343746800000n);
 assert.throws(() => sinceToId("yesterday-ish"));
 assert.equal(renderContent({ type: 500, content: { question: "OK?" } }), "[yes/no] OK?");
+assert.equal(renderContent({ type: 502 }), "[select] (content not returned by API)");
 assert.equal(renderContent({ type: 5, content: { text: "hi", files: [{ name: "a.pdf", key: "attachments/x/y" }] } }), "hi [file a.pdf key=attachments/x/y]");
 console.log("offline asserts ok");
 
