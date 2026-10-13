@@ -89,7 +89,7 @@ function talkName(t: any, meId?: string): string {
 const ACTION_LABEL: Record<number, string> = { 500: "yes/no", 502: "select", 504: "task" };
 
 // Mentions are stored as `{@:<user_id>,<name length>}@Name`; the visible `@Name` follows the marker.
-const MENTION = /\{@:(\d+),\d+\}/g;
+const MENTION = /\{@:(\d+|ALL),\d+\}/g;
 export const cleanMentions = (s: string) => s.replace(MENTION, "");
 const rawText = (m: any): string => (typeof m.content === "string" ? m.content : m.content?.text ?? "");
 
@@ -184,7 +184,7 @@ server.registerTool("read_messages", {
 });
 
 server.registerTool("find_mentions", {
-  description: "Find messages that @mention the current user (or another user) across all talks, newest first. Scans only talks with activity in the window.",
+  description: "Find messages that @mention the current user (or another user), including @ALL, across all talks, newest first. Scans only talks with activity in the window.",
   inputSchema: {
     since: z.string().optional().describe('Relative ("2h", "3d") or ISO date. Default "3d".'),
     user_id: id.optional().describe("Whose mentions to find. Default: current user"),
@@ -202,7 +202,7 @@ server.registerTool("find_mentions", {
   for (const t of active) {
     const names = new Map((t.users ?? []).map((u: any) => [u.user_id_str, u.name]));
     for (const m of await api("GET", `/talks/${t.talk_id_str}/messages?since_id=${after}&count=200`)) {
-      if ([...rawText(m).matchAll(MENTION)].some((x) => x[1] === target))
+      if (m.user_id_str !== target && [...rawText(m).matchAll(MENTION)].some((x) => x[1] === target || x[1] === "ALL"))
         hits.push({
           time: m.created_at_str, talk: talkName(t, me.user_id_str), talk_id: t.talk_id_str,
           from: names.get(m.user_id_str) ?? m.user_id_str, message_id: m.message_id_str, text: renderContent(m),
