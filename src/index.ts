@@ -112,7 +112,8 @@ export function renderContent(m: any): string {
 
 // ---------- server ----------
 
-const server = new McpServer({ name: "direct4b", version: "0.1.0" });
+const { version } = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+const server = new McpServer({ name: "direct4b", version });
 const READ = { readOnlyHint: true, openWorldHint: true };
 const WRITE = { readOnlyHint: false, destructiveHint: false, openWorldHint: true };
 const id = z.string().regex(/^\d+$/, "numeric id string");
