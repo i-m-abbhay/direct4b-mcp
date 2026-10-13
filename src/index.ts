@@ -248,7 +248,8 @@ server.registerTool("download_attachment", {
 });
 
 server.registerTool("create_group_talk", {
-  description: "Create a group talk. Get domain_id from whoami and user_ids from find_user. Confirm with the user before calling.",
+  description:
+    "Create a group talk. Get domain_id from whoami and user_ids from find_user. Do not include the current user's own id (they are added automatically; the API rejects it). Confirm with the user before calling.",
   inputSchema: {
     domain_id: id,
     name: z.string().min(1),
@@ -277,7 +278,7 @@ server.registerTool("create_pair_talk", {
 });
 
 server.registerTool("add_talk_members", {
-  description: "Add users (max 50) to a group talk. Confirm with the user before calling.",
+  description: "Add users (max 50) to a group talk. Users already in the talk are skipped (not listed in `added`). Confirm with the user before calling.",
   inputSchema: { talk_id: id, user_ids: z.array(id).min(1).max(50) },
   annotations: WRITE,
 }, async ({ talk_id, user_ids }) => {
