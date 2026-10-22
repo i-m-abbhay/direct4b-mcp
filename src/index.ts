@@ -46,13 +46,13 @@ const rawIds = (body: string, ids: Record<string, string | string[]>) =>
     body,
   );
 
-async function api(method: string, path: string, body?: { json?: string; form?: URLSearchParams | FormData }): Promise<any> {
+async function api(method: string, path: string, body?: { json?: string; form?: URLSearchParams | FormData }, retries = 3): Promise<any> {
   const headers: Record<string, string> = { Authorization: `Bearer ${token()}` };
   if (body?.json) headers["Content-Type"] = "application/json; charset=UTF-8";
   for (let attempt = 0; ; attempt++) {
     const res = await fetch(BASE + path, { method, headers, body: body?.json ?? body?.form });
     // ponytail: fixed backoff, direct4b doesn't document limits (observed ~10 reads/burst, 24 sends/2min)
-    if (res.status === 429 && attempt < 3) {
+    if (res.status === 429 && attempt < retries) {
       await sleep((Number(res.headers.get("retry-after")) || 15) * 1000);
       continue;
     }
@@ -183,6 +183,28 @@ server.registerTool("read_messages", {
   return ok(`Talk: ${talkName(talk)}\n${lines.join("\n")}\n\nlast message_id: ${msgs.at(-1).message_id_str}`);
 });
 
+// find_mentions cache, per talk: messages already fetched after `from`, up to the talk's max id `upto`.
+// A repeat call only fetches talks with new messages, and only those messages.
+// ponytail: in memory, grows with talk activity until the server restarts.
+type TalkCache = { from: bigint; upto: bigint; msgs: any[] };
+const talkCache = new Map<string, TalkCache>();
+let meCache: any;
+
+export async function messagesAfter(
+  talkId: string, max: bigint, after: bigint,
+  fetchSince: (sinceId: bigint) => Promise<any[]>, cache = talkCache,
+): Promise<any[]> {
+  let c = cache.get(talkId);
+  if (!c || c.from > after) {
+    c = { from: after, upto: max, msgs: await fetchSince(after) };
+    cache.set(talkId, c);
+  } else if (max > c.upto) {
+    c.msgs.push(...(await fetchSince(c.upto)));
+    c.upto = max;
+  }
+  return c.msgs.filter((m) => BigInt(m.message_id_str) > after);
+}
+
 server.registerTool("find_mentions", {
   description: "Find messages that @mention the current user (or another user), including @ALL, across all talks, newest first. Scans only talks with activity in the window.",
   inputSchema: {
@@ -193,15 +215,28 @@ server.registerTool("find_mentions", {
   annotations: READ,
 }, async ({ since, user_id, limit }) => {
   const after = sinceToId(since ?? "3d");
-  const [talks, me] = await Promise.all([api("GET", "/talks"), api("GET", "/users/me")]);
+  const [talks, me] = await Promise.all([api("GET", "/talks"), meCache ?? api("GET", "/users/me")]);
+  meCache = me;
   const target = user_id ?? me.user_id_str;
   const active = talks.filter((t: any) => BigInt(t.max_message_id_str ?? 0) > BigInt(after));
   const hits: any[] = [];
-  // Sequential on purpose: the read rate limit is ~10 rapid calls, api() backs off on 429.
-  // ponytail: 200 messages per talk; a talk busier than that in the window loses its oldest mentions.
+  // Sequential on purpose: the read rate limit is ~10 rapid calls.
+  // ponytail: 200 messages per fetch; a talk busier than that between calls loses its oldest mentions.
+  let skipped = 0;
   for (const t of active) {
     const names = new Map((t.users ?? []).map((u: any) => [u.user_id_str, u.name]));
-    for (const m of await api("GET", `/talks/${t.talk_id_str}/messages?since_id=${after}&count=200`)) {
+    let msgs: any[];
+    try {
+      msgs = await messagesAfter(t.talk_id_str, BigInt(t.max_message_id_str), BigInt(after),
+        // No retries: waiting out a 429 here runs past the client's 60s timeout.
+        (sinceId) => api("GET", `/talks/${t.talk_id_str}/messages?since_id=${sinceId}&count=200`, undefined, 0));
+    } catch (e) {
+      // Rate-limited: return what we have; the cache lets the next call resume.
+      if (!String(e).includes("-> 429")) throw e;
+      skipped = active.length - active.indexOf(t);
+      break;
+    }
+    for (const m of msgs) {
       if (m.user_id_str !== target && [...rawText(m).matchAll(MENTION)].some((x) => x[1] === target || x[1] === "ALL"))
         hits.push({
           time: m.created_at_str, talk: talkName(t, me.user_id_str), talk_id: t.talk_id_str,
@@ -210,7 +245,11 @@ server.registerTool("find_mentions", {
     }
   }
   hits.sort((a, b) => b.time.localeCompare(a.time));
-  return ok(hits.length ? hits.slice(0, limit ?? 20) : `No mentions in ${active.length} active talks since ${since ?? "3d"}.`);
+  const partial = skipped
+    ? `\n\nRate-limited: ${skipped} of ${active.length} active talks not scanned yet. Call again in a minute to finish; scanned talks are cached.`
+    : "";
+  if (!hits.length) return ok(`No mentions in ${active.length - skipped} scanned talks since ${since ?? "3d"}.${partial}`);
+  return ok(partial ? JSON.stringify(hits.slice(0, limit ?? 20), null, 1) + partial : hits.slice(0, limit ?? 20));
 });
 
 server.registerTool("send_message", {

@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { sinceToId, renderContent } from "./dist/index.js";
+import { sinceToId, renderContent, messagesAfter } from "./dist/index.js";
 
 // Real message 1614599054338031616 was sent at 2024-10-12T01:40:12.369Z.
 // (the id's embedded time is ~15ms off created_at, so compare within 1s)
@@ -18,6 +18,21 @@ assert.equal(renderContent({ type: 502 }), "[select] (content not returned by AP
 assert.equal(renderContent({ type: 1, content: "{@:ALL,4}@ALL hi" }), "@ALL hi");
 assert.equal(renderContent({ type: 1, content: "{@:1426865334056386560,10}@Shivankar さん {@:1426865410711486464,6}@Abhay さん\nOK?" }), "@Shivankar さん @Abhay さん\nOK?");
 assert.equal(renderContent({ type: 5, content: { text: "hi", files: [{ name: "a.pdf", key: "attachments/x/y" }] } }), "hi [file a.pdf key=attachments/x/y]");
+// find_mentions cache: refetch only new messages, never a talk with none, and a wider window starts over.
+{
+  const cache = new Map(), fetched = [];
+  const msg = (id) => ({ message_id_str: String(id) });
+  const fetchSince = (store) => async (since) => (fetched.push(since), store.filter((m) => BigInt(m.message_id_str) > since));
+  let store = [msg(11), msg(12)];
+  assert.deepEqual(await messagesAfter("t", 12n, 10n, fetchSince(store), cache), store);
+  assert.deepEqual(await messagesAfter("t", 12n, 10n, fetchSince(store), cache), store);
+  assert.deepEqual(fetched, [10n]);
+  store = [...store, msg(13)];
+  assert.deepEqual((await messagesAfter("t", 13n, 11n, fetchSince(store), cache)).map((m) => m.message_id_str), ["12", "13"]);
+  assert.deepEqual(fetched, [10n, 12n]);
+  await messagesAfter("t", 13n, 5n, fetchSince(store), cache);
+  assert.deepEqual(fetched, [10n, 12n, 5n]);
+}
 console.log("offline asserts ok");
 
 if (!process.env.DIRECT4B_TOKEN && !existsSync(join(homedir(), ".direct4b", "token.json"))) {
@@ -43,6 +58,9 @@ assert.match(msgs, /^Talk: |^No messages/);
 console.log(`read_messages: ${msgs.split("\n").length} lines`);
 const mentions = await call("find_mentions", { since: "3d", limit: 5 });
 assert.ok(!mentions.includes("{@:"), "mention markers should be stripped");
-console.log(`find_mentions: ${mentions.startsWith("[") ? JSON.parse(mentions).length + " found" : mentions}`);
+console.log(`find_mentions: ${mentions.startsWith("[") ? mentions.split("\n\n")[1] ?? "complete" : mentions}`);
+// Second call hits the cache: only talks with new messages are fetched again.
+const again = await call("find_mentions", { since: "3d", limit: 5 });
+console.log(`find_mentions again: ${again.includes("Rate-limited") ? "still partial" : "complete"}`);
 await client.close();
 console.log("live smoke test ok");
