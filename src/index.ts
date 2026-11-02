@@ -7,7 +7,7 @@ import { createServer } from "node:http";
 import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { join, basename, resolve } from "node:path";
-import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync, renameSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const DIR = join(homedir(), ".direct4b");
@@ -161,49 +161,111 @@ server.registerTool("find_user", {
   return ok([...users.values()]);
 });
 
-server.registerTool("read_messages", {
-  description:
-    "Read messages in a talk, oldest first. Defaults to the last 24h. Use `since` for a time window, or `since_id` (exclusive) to page forward from the last message_id you saw.",
-  inputSchema: {
-    talk_id: id,
-    since: z.string().optional().describe('Relative ("30m", "2h", "7d") or ISO date. Default "1d".'),
-    since_id: id.optional().describe("Return messages after this message_id. Overrides `since`."),
-    count: z.number().int().min(1).max(200).optional().describe("Max messages (default 50)"),
+// Talk cache, per talk: messages already fetched after `from`, up to id `upto`, plus `seen`,
+// the last message read_messages returned. A repeat read only fetches what's new.
+// Kept in memory and in ~/.direct4b/cache/<talk_id>.json, so it survives server restarts.
+// ponytail: never pruned and edits/deletes after caching aren't seen; delete the cache dir to reset.
+type TalkCache = { from: bigint; upto: bigint; msgs: any[]; seen?: string };
+type Store = { get(k: string): TalkCache | undefined; set(k: string, v: TalkCache): unknown };
+const CACHE_DIR = process.env.DIRECT4B_CACHE_DIR ?? join(DIR, "cache");
+const mem = new Map<string, TalkCache>();
+const talkCache: Store = {
+  get(k) {
+    if (!mem.has(k)) {
+      try {
+        const c = JSON.parse(readFileSync(join(CACHE_DIR, `${k}.json`), "utf8"));
+        mem.set(k, { ...c, from: BigInt(c.from), upto: BigInt(c.upto) });
+      } catch {} // missing or corrupt: treat as a miss
+    }
+    return mem.get(k);
   },
-  annotations: READ,
-}, async ({ talk_id, since, since_id, count }) => {
-  const after = since_id ?? sinceToId(since ?? "1d");
-  const [talk, msgs] = await Promise.all([
-    api("GET", `/talks/${talk_id}`),
-    api("GET", `/talks/${talk_id}/messages?since_id=${after}&count=${count ?? 50}`),
-  ]);
-  const names = new Map((talk.users ?? []).map((u: any) => [u.user_id_str, u.name]));
-  if (!msgs.length) return ok(`No messages in "${talkName(talk)}" after that point.`);
-  const lines = msgs.map((m: any) => `${m.created_at_str} ${names.get(m.user_id_str) ?? m.user_id_str} (${m.message_id_str}): ${renderContent(m)}`);
-  return ok(`Talk: ${talkName(talk)}\n${lines.join("\n")}\n\nlast message_id: ${msgs.at(-1).message_id_str}`);
-});
-
-// find_mentions cache, per talk: messages already fetched after `from`, up to the talk's max id `upto`.
-// A repeat call only fetches talks with new messages, and only those messages.
-// ponytail: in memory, grows with talk activity until the server restarts.
-type TalkCache = { from: bigint; upto: bigint; msgs: any[] };
-const talkCache = new Map<string, TalkCache>();
+  set(k, v) {
+    mem.set(k, v);
+    mkdirSync(CACHE_DIR, { recursive: true, mode: 0o700 });
+    const f = join(CACHE_DIR, `${k}.json`);
+    // Write then rename, so a parallel server never reads a half-written file.
+    writeFileSync(f + ".tmp", JSON.stringify({ ...v, from: String(v.from), upto: String(v.upto) }), { mode: 0o600 });
+    renameSync(f + ".tmp", f);
+  },
+};
 let meCache: any;
+
+// Only the fields the tools use, so cache files stay small.
+const slim = (m: any) => ({ message_id_str: m.message_id_str, user_id_str: m.user_id_str, created_at_str: m.created_at_str, type: m.type, content: m.content });
+
+/** All messages after sinceId, oldest first. The API returns at most 100 per page, whatever `count` asks. */
+async function fetchSince(talkId: string, sinceId: bigint, retries?: number): Promise<any[]> {
+  const out: any[] = [];
+  // ponytail: 5 pages (500 messages) per call; the rest comes on the next call since `upto` stops at the last one fetched.
+  for (let page = 0; page < 5; page++) {
+    const msgs = await api("GET", `/talks/${talkId}/messages?since_id=${sinceId}&count=100`, undefined, retries);
+    out.push(...msgs.map(slim));
+    if (msgs.length < 100) break;
+    sinceId = BigInt(msgs.at(-1).message_id_str);
+  }
+  return out;
+}
 
 export async function messagesAfter(
   talkId: string, max: bigint, after: bigint,
-  fetchSince: (sinceId: bigint) => Promise<any[]>, cache = talkCache,
+  fetch: (sinceId: bigint) => Promise<any[]>, cache: Store = talkCache,
 ): Promise<any[]> {
-  let c = cache.get(talkId);
+  const old = cache.get(talkId);
+  let c = old;
+  // `upto` is the last message actually fetched, so a capped fetch resumes where it stopped.
+  const upto = (msgs: any[]) => (msgs.length ? BigInt(msgs.at(-1).message_id_str) : max);
   if (!c || c.from > after) {
-    c = { from: after, upto: max, msgs: await fetchSince(after) };
+    const msgs = await fetch(after);
+    c = { from: after, upto: upto(msgs), msgs, seen: old?.seen };
     cache.set(talkId, c);
   } else if (max > c.upto) {
-    c.msgs.push(...(await fetchSince(c.upto)));
-    c.upto = max;
+    const msgs = await fetch(c.upto);
+    c.msgs.push(...msgs);
+    c.upto = msgs.length ? upto(msgs) : max;
+    cache.set(talkId, c);
   }
   return c.msgs.filter((m) => BigInt(m.message_id_str) > after);
 }
+
+// A translation bot reposts each message as "<sender> said: <translation>", doubling every read.
+export const isTranslation = (text: string, names: Iterable<string>) =>
+  [...names].some((n) => text.startsWith(`${n} said:`));
+
+// Local time to the minute: "2026-10-29 17:37".
+const localTime = (iso: string) => new Date(iso).toLocaleString("sv-SE").slice(0, 16);
+const utcOffset = () => {
+  const o = -new Date().getTimezoneOffset() / 60;
+  return `UTC${o >= 0 ? "+" : ""}${o}`;
+};
+
+server.registerTool("read_messages", {
+  description:
+    'Read messages in a talk, oldest first. Defaults to the last 24h. `since: "new"` returns only messages after the last ones read_messages returned for this talk (even in an earlier session): use it to catch up cheaply. Use `since_id` (exclusive) to page forward from the last message_id shown. Translation-bot copies are hidden unless `translations` is true.',
+  inputSchema: {
+    talk_id: id,
+    since: z.string().optional().describe('"new", relative ("30m", "2h", "7d") or ISO date. Default "1d".'),
+    since_id: id.optional().describe("Return messages after this message_id. Overrides `since`."),
+    count: z.number().int().min(1).max(200).optional().describe("Max messages (default 50)"),
+    translations: z.boolean().optional().describe('Include translation-bot copies ("<name> said: ..."). Default false'),
+  },
+  annotations: READ,
+}, async ({ talk_id, since, since_id, count, translations }) => {
+  const talk = await api("GET", `/talks/${talk_id}`);
+  const after = since_id ?? (since === "new" ? talkCache.get(talk_id)?.seen ?? sinceToId("1d") : sinceToId(since ?? "1d"));
+  const all = await messagesAfter(talk_id, BigInt(talk.max_message_id_str ?? 0), BigInt(after), (s) => fetchSince(talk_id, s));
+  const names = new Map<string, string>((talk.users ?? []).map((u: any) => [u.user_id_str, u.name]));
+  const shown = all
+    .map((m) => ({ m, text: renderContent(m) }))
+    .filter(({ text }) => translations || !isTranslation(text, names.values()))
+    .slice(0, count ?? 50);
+  // Mark as seen up to the last message shown, or past everything if all were hidden. Only moves forward.
+  const last = shown.length ? shown.at(-1)!.m : all.at(-1);
+  const c = talkCache.get(talk_id)!;
+  if (last && BigInt(last.message_id_str) > BigInt(c.seen ?? 0)) talkCache.set(talk_id, { ...c, seen: last.message_id_str });
+  if (!shown.length) return ok(`No messages in "${talkName(talk)}" after that point.`);
+  const lines = shown.map(({ m, text }) => `${localTime(m.created_at_str)} ${names.get(m.user_id_str) ?? m.user_id_str}: ${text}`);
+  return ok(`Talk: ${talkName(talk)} (times ${utcOffset()})\n${lines.join("\n")}\n\nlast message_id: ${last.message_id_str}`);
+});
 
 server.registerTool("find_mentions", {
   description: "Find messages that @mention the current user (or another user), including @ALL, across all talks, newest first. Scans only talks with activity in the window.",
@@ -221,15 +283,14 @@ server.registerTool("find_mentions", {
   const active = talks.filter((t: any) => BigInt(t.max_message_id_str ?? 0) > BigInt(after));
   const hits: any[] = [];
   // Sequential on purpose: the read rate limit is ~10 rapid calls.
-  // ponytail: 200 messages per fetch; a talk busier than that between calls loses its oldest mentions.
   let skipped = 0;
   for (const t of active) {
-    const names = new Map((t.users ?? []).map((u: any) => [u.user_id_str, u.name]));
+    const names = new Map<string, string>((t.users ?? []).map((u: any) => [u.user_id_str, u.name]));
     let msgs: any[];
     try {
       msgs = await messagesAfter(t.talk_id_str, BigInt(t.max_message_id_str), BigInt(after),
         // No retries: waiting out a 429 here runs past the client's 60s timeout.
-        (sinceId) => api("GET", `/talks/${t.talk_id_str}/messages?since_id=${sinceId}&count=200`, undefined, 0));
+        (sinceId) => fetchSince(t.talk_id_str, sinceId, 0));
     } catch (e) {
       // Rate-limited: return what we have; the cache lets the next call resume.
       if (!String(e).includes("-> 429")) throw e;
@@ -237,7 +298,8 @@ server.registerTool("find_mentions", {
       break;
     }
     for (const m of msgs) {
-      if (m.user_id_str !== target && [...rawText(m).matchAll(MENTION)].some((x) => x[1] === target || x[1] === "ALL"))
+      if (m.user_id_str !== target && !isTranslation(renderContent(m), names.values())
+        && [...rawText(m).matchAll(MENTION)].some((x) => x[1] === target || x[1] === "ALL"))
         hits.push({
           time: m.created_at_str, talk: talkName(t, me.user_id_str), talk_id: t.talk_id_str,
           from: names.get(m.user_id_str) ?? m.user_id_str, message_id: m.message_id_str, text: renderContent(m),

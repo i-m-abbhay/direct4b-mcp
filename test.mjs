@@ -5,7 +5,9 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { sinceToId, renderContent, messagesAfter } from "./dist/index.js";
+import { mkdtempSync, readdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { sinceToId, renderContent, messagesAfter, isTranslation } from "./dist/index.js";
 
 // Real message 1614599054338031616 was sent at 2024-10-12T01:40:12.369Z.
 // (the id's embedded time is ~15ms off created_at, so compare within 1s)
@@ -33,6 +35,8 @@ assert.equal(renderContent({ type: 5, content: { text: "hi", files: [{ name: "a.
   await messagesAfter("t", 13n, 5n, fetchSince(store), cache);
   assert.deepEqual(fetched, [10n, 12n, 5n]);
 }
+assert.ok(isTranslation("原田岳 said:\nThank you.", ["Abhay", "原田岳"]));
+assert.ok(!isTranslation("原田岳さんへ said: no", ["原田岳"]));
 console.log("offline asserts ok");
 
 if (!process.env.DIRECT4B_TOKEN && !existsSync(join(homedir(), ".direct4b", "token.json"))) {
@@ -40,7 +44,11 @@ if (!process.env.DIRECT4B_TOKEN && !existsSync(join(homedir(), ".direct4b", "tok
   process.exit(0);
 }
 const client = new Client({ name: "test", version: "0" });
-await client.connect(new StdioClientTransport({ command: process.execPath, args: ["dist/index.js"] }));
+// Own cache dir, so the test never moves the real "seen" markers.
+const cacheDir = mkdtempSync(join(tmpdir(), "d4b-cache-"));
+await client.connect(new StdioClientTransport({
+  command: process.execPath, args: ["dist/index.js"], env: { ...process.env, DIRECT4B_CACHE_DIR: cacheDir },
+}));
 const tools = (await client.listTools()).tools.map((t) => t.name);
 console.log("tools:", tools.join(", "));
 const call = async (name, args = {}) => {
@@ -56,6 +64,10 @@ console.log(`list_talks: ${talks.length} talks`);
 const msgs = await call("read_messages", { talk_id: talks[0].talk_id, since: "7d", count: 5 });
 assert.match(msgs, /^Talk: |^No messages/);
 console.log(`read_messages: ${msgs.split("\n").length} lines`);
+assert.ok(readdirSync(cacheDir).includes(`${talks[0].talk_id}.json`), "talk cached on disk");
+// Right after a full read, "new" has nothing (unless a message lands in between).
+const fresh = await call("read_messages", { talk_id: talks[0].talk_id, since: "new" });
+console.log(`read_messages new: ${fresh.startsWith("No messages") ? "nothing new" : `${fresh.split("\n").length} lines`}`);
 const mentions = await call("find_mentions", { since: "3d", limit: 5 });
 assert.ok(!mentions.includes("{@:"), "mention markers should be stripped");
 console.log(`find_mentions: ${mentions.startsWith("[") ? mentions.split("\n\n")[1] ?? "complete" : mentions}`);

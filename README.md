@@ -9,8 +9,10 @@ MCP server for [direct](https://direct4b.com) (direct4b) business chat. Lets Cla
 | `whoami` | Your user, unread count, organizations (`domain_id`) |
 | `list_talks` | Your group talks and DMs, filter by name or member |
 | `find_user` | Find a coworker's `user_id` by name |
-| `read_messages` | Messages in a talk: last 24h by default, or `since: "2h"` / ISO date / `since_id` |
-| `find_mentions` | Messages that @mention you (or anyone) across all talks, newest first. Caches each talk, so repeat calls fetch only new messages; if direct4b rate-limits a scan it returns a partial result and the next call resumes |
+| `read_messages` | Messages in a talk: last 24h by default, or `since: "2h"` / ISO date / `since_id`. `since: "new"` returns only what came after the last read, even from an earlier session. Translation-bot copies ("&lt;name&gt; said: …") are hidden unless `translations: true` |
+| `find_mentions` | Messages that @mention you (or anyone) across all talks, newest first. If direct4b rate-limits a scan it returns a partial result and the next call resumes |
+
+Both tools cache each talk's messages in `~/.direct4b/cache/<talk_id>.json` (override with `DIRECT4B_CACHE_DIR`), so repeat reads, across sessions too, fetch only new messages. The cache holds chat content: it's written owner-only, and deleting the folder resets it.
 | `send_message` | Post text |
 | `send_action` | Post a yes/no question, multiple-choice select, or task |
 | `send_file` | Upload a local file |
